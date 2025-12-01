@@ -40,7 +40,6 @@ import pandas as pd
 import pypsa
 import xarray as xr
 import yaml
-from linopy.remote.oetc import OetcCredentials, OetcHandler, OetcSettings
 from pypsa.descriptors import get_activity_mask
 from pypsa.descriptors import get_switchable_as_dense as get_as_dense
 
@@ -53,6 +52,7 @@ from scripts._helpers import (
     update_config_from_wildcards,
 )
 
+from scripts.build_spores import run_spores
 logger = logging.getLogger(__name__)
 
 # Allow for PyPSA versions <0.35
@@ -457,15 +457,17 @@ def prepare_network(
             n.links_t.p_min_pu,
             n.storage_units_t.inflow,
         ):
-            df.where(df.abs() > solve_opts["clip_p_max_pu"], other=0.0, inplace=True)
+            df.where(df > solve_opts["clip_p_max_pu"], other=0.0, inplace=True)
 
     if load_shedding := solve_opts.get("load_shedding"):
         # intersect between macroeconomic and surveybased willingness to pay
         # http://journal.frontiersin.org/article/10.3389/fenrg.2015.00055/full
-        n.add("Carrier", "load")
+        # TODO: retrieve color and nice name from config
+        n.add("Carrier", "load", color="#dd2e23", nice_name="Load shedding")
         buses_i = n.buses.index
-        if isinstance(load_shedding, bool):
-            load_shedding = 1e5  # Eur/MWh
+        if not np.isscalar(load_shedding):
+            # TODO: do not scale via sign attribute (use Eur/MWh instead of Eur/kWh)
+            load_shedding = 3000  # Eur/MWh
 
         n.add(
             "Generator",
@@ -473,8 +475,9 @@ def prepare_network(
             " load",
             bus=buses_i,
             carrier="load",
-            marginal_cost=load_shedding,  # Eur/MWh
-            p_nom=np.inf,
+            # sign=1e-3,  # Adjust sign to measure p and p_nom in kW instead of MW
+            marginal_cost=load_shedding,  # Eur/kWh
+            p_nom=1e5,  # MW
         )
 
     if solve_opts.get("curtailment_mode"):
@@ -749,12 +752,13 @@ def add_SAFE_constraints(n, config):
     Which sets a reserve margin of 10% above the peak demand.
     """
     peakdemand = n.loads_t.p_set.sum(axis=1).max()
-    margin = 1.0 + config["electricity"]["SAFE_reservemargin"]
+    margin = 1.0 + 0.1 #config["electricity"]["SAFE_reservemargin"]
     reserve_margin = peakdemand * margin
     conventional_carriers = config["electricity"]["conventional_carriers"]  # noqa: F841
     ext_gens_i = n.generators.query(
         "carrier in @conventional_carriers & p_nom_extendable"
     ).index
+
     p_nom = n.model["Generator-p_nom"].loc[ext_gens_i]
     lhs = p_nom.sum()
     exist_conv_caps = n.generators.query(
@@ -1231,8 +1235,10 @@ def extra_functionality(
 
     if config["sector"]["imports"]["enable"]:
         add_import_limit_constraint(n, snapshots)
+    
 
     if n.params.custom_extra_functionality:
+        
         source_path = n.params.custom_extra_functionality
         assert os.path.exists(source_path), f"{source_path} does not exist"
         sys.path.append(os.path.dirname(source_path))
@@ -1333,17 +1339,6 @@ def solve_network(
     kwargs["assign_all_duals"] = cf_solving.get("assign_all_duals", False)
     kwargs["io_api"] = cf_solving.get("io_api", None)
 
-    oetc = solving.get("oetc", None)
-    if oetc:
-        oetc["credentials"] = OetcCredentials(
-            email=os.environ["OETC_EMAIL"], password=os.environ["OETC_PASSWORD"]
-        )
-        oetc["solver"] = kwargs["solver_name"]
-        oetc["solver_options"] = kwargs["solver_options"]
-        oetc_settings = OetcSettings(**oetc)
-        oetc_handler = OetcHandler(oetc_settings)
-        kwargs["remote"] = oetc_handler
-
     kwargs["model_kwargs"] = cf_solving.get("model_kwargs", {})
     kwargs["keep_files"] = cf_solving.get("keep_files", False)
 
@@ -1416,6 +1411,17 @@ if __name__ == "__main__":
     np.random.seed(solve_opts.get("seed", 123))
 
     n = pypsa.Network(snakemake.input.network)
+    
+    # FIXME
+    # overwrite the shitty caps_max for BE
+    idx = n.generators[
+        n.generators.index.str.startswith("BE0 0 0 off")
+    ].index
+
+    n.generators.loc[idx,"p_nom_max"] = 8000/3
+    
+    logger.info(f"update stupid values for Belgium to {n.generators.loc[idx,'p_nom_max']}")
+    
     planning_horizons = snakemake.wildcards.get("planning_horizons", None)
 
     prepare_network(
@@ -1447,6 +1453,7 @@ if __name__ == "__main__":
 
     n.meta = dict(snakemake.config, **dict(wildcards=dict(snakemake.wildcards)))
     n.export_to_netcdf(snakemake.output.network)
+    print(n.model.constraints)
 
     with open(snakemake.output.config, "w") as file:
         yaml.dump(
@@ -1456,3 +1463,69 @@ if __name__ == "__main__":
             allow_unicode=True,
             sort_keys=False,
         )
+        
+    print(n.links)
+        
+    spores_config = snakemake.params.spores
+    
+    if spores_config.get("enable",False):
+        
+        logger.info("spores mode identified.")
+        
+        spores_run = {"SPORES": spores_config["config"]}
+        
+        # update the info
+# spore_technologies: # Target technologies when running SPORES.
+# - Link:
+#     attribute: p_nom
+#     index: ["H2 Turbine"]
+# intensifiable_technologies: ["H2 Turbine"]
+        
+        logger.info("spores config preparation with: {}".format(spores_config["config"]))
+        
+        spored_technologies = spores_config["config"]["spore_technologies"]
+        
+        st = []
+        for _ in spored_technologies:
+            for component,v in _.items():
+                k = component.lower() + "s"
+                df =getattr(n,k)
+                idx = df.loc[df.carrier.isin(v["index"])].index.tolist()
+                v["index"] = idx
+            st.append(_)
+            
+
+        spores_config["config"]["spore_technologies"] = st
+                
+        
+        intensifiable_technologies = spores_config["config"]["intensifiable_technologies"]
+        it = []
+        for x in ["links","generators","stores","storage_units"]:
+            df = getattr(n,x)
+            
+            it.extend(df.loc[df.carrier.isin(intensifiable_technologies)].index.tolist())
+            
+
+        spores_config["config"]["intensifiable_technologies"] = it
+                    
+        logger.info(snakemake.params.solving["options"])
+        spore_networks, weights, spore_models, deploy_his = run_spores(
+            least_cost_network=n,
+            spores_config=spores_run,
+            solver_options=snakemake.params.solving,
+            weighting_method='relative_deployment'
+        )
+        
+        
+        # Save each spore network as a .nc file
+        pp = snakemake.output.network.replace(".nc","__spore_{i}.nc")
+        
+        for i, (spore_name, net) in enumerate(spore_networks.items(), start=1):
+            net.export_to_netcdf(pp.format(i=i))
+            print(net.links)
+
+        # # Optionally save weights and history as YAML or pickle
+        # with open(f"{output_dir}/weights.yaml", "w") as f:
+        #     yaml.dump(weights, f)
+    
+    
